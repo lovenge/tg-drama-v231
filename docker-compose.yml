@@ -1,0 +1,15 @@
+services:
+  tg-drama:
+    build: .
+    container_name: tg-drama-v2
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      TZ: Asia/Shanghai
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-please-change-this-token}
+      DATA_DIR: /data
+      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-90}
+      INITIAL_SCAN_LIMIT: ${INITIAL_SCAN_LIMIT:-3000}
+    volumes:
+      - ./data:/data
