@@ -42,6 +42,13 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_episodes_drama ON episodes(drama_id, episode_number);
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        -- V2.5：低置信度消息先存这里，人工审核通过才入库
+        CREATE TABLE IF NOT EXISTS pending_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+          title TEXT, text TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(channel_id, message_id)
+        );
         """)
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('telegram_api_id','')")
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('telegram_api_hash','')")
@@ -50,6 +57,11 @@ def init_db():
         if "cover_url" not in cols: c.execute("ALTER TABLE dramas ADD COLUMN cover_url TEXT")
         channel_cols = {r[1] for r in c.execute("PRAGMA table_info(channels)")}
         if "deleted" not in channel_cols: c.execute("ALTER TABLE channels ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+        # V2.4：缓存探测到的封装/编码/文件大小，避免每次播放重复探测
+        ep_cols = {r[1] for r in c.execute("PRAGMA table_info(episodes)")}
+        for col in ("container", "video_codec", "audio_codec", "file_size"):
+            if col not in ep_cols:
+                c.execute(f"ALTER TABLE episodes ADD COLUMN {col} TEXT")
 
 def setting(key, value=None):
     with conn() as c:
@@ -67,7 +79,9 @@ def add_channel(username):
 
 def list_channels(include_deleted=False):
     with conn() as c:
-        sql = "SELECT * FROM channels" + ("" if include_deleted else " WHERE deleted=0") + " ORDER BY id"
+        sql = """SELECT ch.*,
+                  (SELECT COUNT(*) FROM episodes e WHERE e.channel_id=ch.id) AS episode_count
+                 FROM channels ch""" + ("" if include_deleted else " WHERE ch.deleted=0") + " ORDER BY ch.id"
         return [dict(r) for r in c.execute(sql)]
 
 def update_channel(channel_id, enabled):
@@ -75,11 +89,59 @@ def update_channel(channel_id, enabled):
         cur=c.execute("UPDATE channels SET enabled=? WHERE id=? AND deleted=0", (1 if enabled else 0, channel_id))
         return cur.rowcount > 0
 
-def delete_channel(channel_id):
-    # Soft-delete: keep the row because historical episodes reference channel_id.
+def clear_channel_resources(channel_id):
+    """只清空该频道已经采集的集数，频道本身保留、继续采集。
+    返回删掉了多少集。"""
     with conn() as c:
-        cur=c.execute("UPDATE channels SET enabled=0,deleted=1 WHERE id=? AND deleted=0", (channel_id,))
-        return cur.rowcount > 0
+        if not c.execute("SELECT id FROM channels WHERE id=? AND deleted=0", (channel_id,)).fetchone():
+            return -1
+        cur = c.execute("DELETE FROM episodes WHERE channel_id=?", (channel_id,))
+        c.execute("DELETE FROM pending_audit WHERE channel_id=?", (channel_id,))
+        c.execute("DELETE FROM dramas WHERE id NOT IN (SELECT DISTINCT drama_id FROM episodes)")
+        return cur.rowcount
+
+def delete_channel(channel_id, cascade=False):
+    """删除频道：默认软删并保留历史资源；cascade=True 时连带删掉该频道的所有集数，
+    并清理已经没有任何集数的孤儿作品。"""
+    with conn() as c:
+        cur = c.execute("UPDATE channels SET enabled=0,deleted=1 WHERE id=? AND deleted=0", (channel_id,))
+        if cur.rowcount == 0:
+            return False
+        if cascade:
+            c.execute("DELETE FROM episodes WHERE channel_id=?", (channel_id,))
+            c.execute("DELETE FROM pending_audit WHERE channel_id=?", (channel_id,))
+            c.execute("DELETE FROM dramas WHERE id NOT IN (SELECT DISTINCT drama_id FROM episodes)")
+        return True
+
+def drama_sources(drama_id):
+    """该作品的集数分别来自哪些频道（去重）。"""
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            """SELECT DISTINCT c.id, c.username, c.title, c.enabled, c.deleted
+               FROM episodes e JOIN channels c ON c.id=e.channel_id
+               WHERE e.drama_id=? ORDER BY c.username""", (drama_id,))]
+
+# ---------- V2.5 待审核队列 ----------
+def add_pending(channel_id, message_id, title="", text=""):
+    with conn() as c:
+        c.execute("""INSERT OR IGNORE INTO pending_audit(channel_id,message_id,title,text)
+                     VALUES(?,?,?,?)""", (channel_id, message_id, (title or "")[:200], (text or "")[:4000]))
+
+def list_pending(limit=100):
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            """SELECT p.*, ch.username, ch.title AS channel_title FROM pending_audit p
+               JOIN channels ch ON ch.id=p.channel_id
+               ORDER BY p.id DESC LIMIT ?""", (limit,))]
+
+def get_pending(pending_id):
+    with conn() as c:
+        r = c.execute("SELECT * FROM pending_audit WHERE id=?", (pending_id,)).fetchone()
+        return dict(r) if r else None
+
+def delete_pending(pending_id):
+    with conn() as c:
+        c.execute("DELETE FROM pending_audit WHERE id=?", (pending_id,))
 
 def get_channel(channel_id):
     with conn() as c:
@@ -158,6 +220,21 @@ def stats():
         no_cover=c.execute("SELECT COUNT(*) n FROM dramas WHERE cover_url IS NULL OR cover_url='' ").fetchone()["n"]
         cats={r["category"]:r["n"] for r in c.execute("SELECT category,COUNT(*) n FROM dramas GROUP BY category")}
         return {"dramas":total,"episodes":eps,"channels":channels,"missing_covers":no_cover,"categories":cats}
+
+def get_episode(episode_id):
+    """取播放所需的集数信息（含频道用户名）。"""
+    with conn() as c:
+        r = c.execute("""SELECT e.id,e.drama_id,e.channel_id,e.message_id,e.message_url,e.message_text,
+          e.media_type,e.quality,e.container,e.video_codec,e.audio_codec,e.file_size,c.username
+          FROM episodes e JOIN channels c ON c.id=e.channel_id WHERE e.id=?""", (episode_id,)).fetchone()
+        return dict(r) if r else None
+
+def set_probe(episode_id, container=None, video_codec=None, audio_codec=None, file_size=None):
+    with conn() as c:
+        c.execute("""UPDATE episodes SET container=COALESCE(?,container), video_codec=COALESCE(?,video_codec),
+          audio_codec=COALESCE(?,audio_codec), file_size=COALESCE(?,file_size) WHERE id=?""",
+                  (container, video_codec, audio_codec, None if file_size is None else str(file_size), episode_id))
+
 
 def admin_dramas(q=None, category=None, limit=100):
     return list_dramas(category, q, limit, 0)
