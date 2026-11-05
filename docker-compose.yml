@@ -1,7 +1,7 @@
 services:
   tg-drama:
     build: .
-    container_name: tg-drama-v2
+    container_name: tg-drama-v34
     restart: unless-stopped
     ports:
       - "8787:8787"
@@ -11,5 +11,12 @@ services:
       DATA_DIR: /data
       SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-90}
       INITIAL_SCAN_LIMIT: ${INITIAL_SCAN_LIMIT:-3000}
+      # 播放相关（V2.4）
+      STREAM_IDLE_TIMEOUT: ${STREAM_IDLE_TIMEOUT:-35}      # Telegram 多久没数据判定为卡死
+      REMUX_START_TIMEOUT: ${REMUX_START_TIMEOUT:-30}      # 转封装首个数据块超时
+      MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS:-2} # 同时播放路数，RK3566 建议 2
+      ALLOW_TRANSCODE: ${ALLOW_TRANSCODE:-0}               # 1=允许软件转码（CPU 占用高）
+      TRANSCODE_HEIGHT: ${TRANSCODE_HEIGHT:-1080}
+      PROBE_BYTES: ${PROBE_BYTES:-1048576}                 # 默认探测 1MB，减少播放前预读；识别失败可调回 2097152
     volumes:
       - ./data:/data
